@@ -1,0 +1,480 @@
+// ============================================================
+// نظام ERP / POS متعدد المنافذ - منتجع فالي
+// مخطط قاعدة البيانات الكامل (يشمل المراجعة الشاملة: المرتجعات، التسويات،
+// سجل حركة المخزون، إلغاء المشتريات، الموردون، وضبط الوردية)
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+  // "native" لبيئة التطوير المحلية على جهازك (Windows)، و"debian-openssl-3.0.x"
+  // لخادم الإنتاج على Hostinger (توزيعات Linux الحديثة المبنية على Debian/Ubuntu
+  // بـ OpenSSL 3.0 - وهي الأشيع في استضافات Node.js المُدارة). أضفت أيضاً
+  // "debian-openssl-1.1.x" كتغطية إضافية إن كانت نسخة OpenSSL على الخادم أقدم.
+  // بدون هذا، ينشئ `prisma generate` محرك Windows فقط، وهو غير صالح إطلاقاً
+  // على خادم Linux مهما كانت باقي الإعدادات صحيحة.
+  binaryTargets = ["native", "debian-openssl-3.0.x", "debian-openssl-1.1.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------
+// Enums
+// ------------------------------------------------------------
+
+enum LocationType {
+  warehouse
+  pos
+}
+
+enum PaymentMethod {
+  cash
+  card
+  split
+}
+
+enum ShiftStatus {
+  open
+  closed
+}
+
+enum TransferStatus {
+  completed
+}
+
+enum PurchaseStatus {
+  active
+  cancelled
+}
+
+// كل حركة تصيب رصيد صنف في موقع مُسجَّلة بأحد هذه الأنواع - هذا هو سجل
+// التدقيق الموحّد (Ledger) الذي تُبنى منه شاشة "تتبع مسار الصنف"
+enum StockMovementType {
+  purchase
+  purchase_cancelled
+  transfer_in
+  transfer_out
+  sale
+  refund
+  adjustment
+}
+
+enum AdjustmentReason {
+  damaged
+  expired
+  lost
+  found
+  count_correction
+  other
+}
+
+// ------------------------------------------------------------
+// المواقع (المستودع ومنافذ البيع)
+// ------------------------------------------------------------
+
+model Location {
+  id        String       @id @default(cuid())
+  name      String
+  type      LocationType
+  isActive  Boolean      @default(true)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  categories       Category[]
+  inventoryStocks  InventoryStock[]
+  purchases        Purchase[]          @relation("PurchaseDestination")
+  transfersFrom    StockTransfer[]     @relation("TransferFrom")
+  transfersTo      StockTransfer[]     @relation("TransferTo")
+  shifts           Shift[]
+  orders           Order[]
+  assignedUsers    User[]
+  stockMovements   StockMovement[]
+  adjustments      InventoryAdjustment[]
+  refunds          Refund[]
+
+  @@index([type])
+}
+
+// ------------------------------------------------------------
+// المستخدمون والصلاحيات الديناميكية (RBAC)
+// ------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  username     String   @unique
+  passwordHash String
+  isActive     Boolean  @default(true)
+  roleId       String
+  locationId   String? // الفرع/المنفذ الافتراضي (اختياري - يُستخدم لتوجيه الكاشير مباشرة لنقطة بيعه)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  role              Role                  @relation(fields: [roleId], references: [id])
+  location          Location?             @relation(fields: [locationId], references: [id])
+  purchases         Purchase[]            @relation("PurchaseCreatedBy")
+  cancelledPurchases Purchase[]           @relation("PurchaseCancelledBy")
+  stockTransfers    StockTransfer[]
+  shifts            Shift[]
+  orders            Order[]
+  stockMovements    StockMovement[]
+  adjustments       InventoryAdjustment[]
+  refunds           Refund[]
+
+  @@index([roleId])
+  @@index([locationId])
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users       User[]
+  permissions RolePermission[]
+}
+
+model Permission {
+  id     String @id @default(cuid())
+  key    String @unique // e.g. pos.sell, inventory.purchase, reports.view
+  name   String
+  module String // POS, Warehouse, Reports, Settings ...
+
+  roles RolePermission[]
+
+  @@index([module])
+}
+
+model RolePermission {
+  id           String @id @default(cuid())
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+}
+
+// ------------------------------------------------------------
+// الموردون
+// ------------------------------------------------------------
+
+model Supplier {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  phone     String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  purchases Purchase[]
+}
+
+// ------------------------------------------------------------
+// المنتجات والتصنيفات
+// ------------------------------------------------------------
+
+model Category {
+  id         String   @id @default(cuid())
+  name       String
+  locationId String
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  location Location  @relation(fields: [locationId], references: [id])
+  products Product[]
+
+  @@index([locationId])
+}
+
+model Product {
+  id            String   @id @default(cuid())
+  name          String
+  categoryId    String
+  barcode       String?  @unique
+  price         Decimal  @db.Decimal(10, 2) // سعر البيع
+  costPrice     Decimal? @db.Decimal(10, 2) // آخر/مرجعي سعر شراء - يُحدَّث تلقائياً عند كل توريد جديد
+  minStockLevel Int? // الحد الأدنى لإعادة الطلب - يُستخدم في تنبيهات المخزون الحرج
+  imageUrl      String?
+  isActive      Boolean  @default(true) // تعطيل (Soft Delete) بدل الحذف الفعلي حفاظاً على سجلات المبيعات القديمة
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  category        Category              @relation(fields: [categoryId], references: [id])
+  inventoryStocks InventoryStock[]
+  purchaseItems   PurchaseItem[]
+  transferItems   TransferItem[]
+  orderItems      OrderItem[]
+  stockMovements  StockMovement[]
+  adjustments     InventoryAdjustment[]
+  refundItems     RefundItem[]
+
+  @@index([categoryId])
+}
+
+// ------------------------------------------------------------
+// المخزون
+// ------------------------------------------------------------
+
+model InventoryStock {
+  id         String   @id @default(cuid())
+  productId  String
+  locationId String
+  quantity   Decimal  @db.Decimal(12, 2) @default(0)
+  updatedAt  DateTime @updatedAt
+
+  product  Product  @relation(fields: [productId], references: [id])
+  location Location @relation(fields: [locationId], references: [id])
+
+  @@unique([productId, locationId])
+  @@index([locationId])
+}
+
+// سجل تدقيق موحّد: كل عملية تغيّر رصيد صنف في موقع (شراء، إلغاء شراء، تحويل
+// وارد/صادر، بيع، مرتجع، تسوية) تُسجَّل هنا مع الرصيد بعد العملية مباشرة.
+// هذا هو مصدر شاشة "تتبع مسار الصنف" (Item Movement History / Ledger).
+model StockMovement {
+  id             String            @id @default(cuid())
+  productId      String
+  locationId     String
+  type           StockMovementType
+  quantityChange Decimal           @db.Decimal(12, 2) // موجب = إضافة، سالب = خصم
+  balanceAfter   Decimal           @db.Decimal(12, 2)
+  referenceType  String? // "Purchase" | "StockTransfer" | "Order" | "Refund" | "InventoryAdjustment"
+  referenceId    String?
+  note           String?
+  createdById    String
+  createdAt      DateTime          @default(now())
+
+  product   Product  @relation(fields: [productId], references: [id])
+  location  Location @relation(fields: [locationId], references: [id])
+  createdBy User     @relation(fields: [createdById], references: [id])
+
+  @@index([productId, locationId])
+  @@index([createdAt])
+  @@index([type])
+}
+
+// تالف / هدر / فروقات جرد يدوي
+model InventoryAdjustment {
+  id             String           @id @default(cuid())
+  productId      String
+  locationId     String
+  quantityChange Decimal          @db.Decimal(12, 2) // سالب دائماً للتالف/الهدر، موجب لتصحيح جرد بالزيادة
+  reason         AdjustmentReason
+  reasonNote     String?
+  createdById    String
+  createdAt      DateTime         @default(now())
+
+  product   Product  @relation(fields: [productId], references: [id])
+  location  Location @relation(fields: [locationId], references: [id])
+  createdBy User     @relation(fields: [createdById], references: [id])
+
+  @@index([productId, locationId])
+  @@index([createdAt])
+}
+
+// ------------------------------------------------------------
+// المشتريات
+// ------------------------------------------------------------
+
+model Purchase {
+  id                     String         @id @default(cuid())
+  invoiceNumber          String?        @unique // اختياري - يُولَّد رقم داخلي تلقائياً إن تُرك فارغاً
+  destinationLocationId  String
+  supplierId             String? // اختياري - قد لا يوجد مورد مسجَّل مسبقاً (اسم حر فقط)
+  supplierName           String // نسخة نصية محفوظة دائماً (حتى لو حُذّف المورد لاحقاً تبقى الفاتورة قابلة للقراءة)
+  invoiceImagePath       String
+  totalCost              Decimal        @db.Decimal(12, 2)
+  purchasedAt            DateTime
+  status                 PurchaseStatus @default(active)
+  cancelledAt            DateTime?
+  cancelledById          String?
+  cancellationReason     String?
+  createdById            String
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+
+  destinationLocation Location       @relation("PurchaseDestination", fields: [destinationLocationId], references: [id])
+  supplier            Supplier?      @relation(fields: [supplierId], references: [id])
+  createdBy           User           @relation("PurchaseCreatedBy", fields: [createdById], references: [id])
+  cancelledBy         User?          @relation("PurchaseCancelledBy", fields: [cancelledById], references: [id])
+  items               PurchaseItem[]
+
+  @@index([destinationLocationId])
+  @@index([purchasedAt])
+  @@index([status])
+}
+
+model PurchaseItem {
+  id         String  @id @default(cuid())
+  purchaseId String
+  productId  String
+  quantity   Decimal @db.Decimal(12, 2)
+  costPrice  Decimal @db.Decimal(10, 2)
+  totalCost  Decimal @db.Decimal(12, 2)
+
+  purchase Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id])
+
+  @@index([purchaseId])
+  @@index([productId])
+}
+
+// ------------------------------------------------------------
+// التحويلات المخزنية (مرنة بين أي موقعين - مستودع أو منفذ)
+// ------------------------------------------------------------
+
+model StockTransfer {
+  id             String         @id @default(cuid())
+  transferNumber String         @unique
+  fromLocationId String
+  toLocationId   String
+  createdById    String
+  status         TransferStatus @default(completed)
+  createdAt      DateTime       @default(now())
+
+  fromLocation Location       @relation("TransferFrom", fields: [fromLocationId], references: [id])
+  toLocation   Location       @relation("TransferTo", fields: [toLocationId], references: [id])
+  createdBy    User           @relation(fields: [createdById], references: [id])
+  items        TransferItem[]
+
+  @@index([fromLocationId])
+  @@index([toLocationId])
+}
+
+model TransferItem {
+  id              String  @id @default(cuid())
+  stockTransferId String
+  productId       String
+  quantity        Decimal @db.Decimal(12, 2)
+
+  stockTransfer StockTransfer @relation(fields: [stockTransferId], references: [id], onDelete: Cascade)
+  product       Product       @relation(fields: [productId], references: [id])
+
+  @@index([stockTransferId])
+  @@index([productId])
+}
+
+// ------------------------------------------------------------
+// الورديات (Shifts) - مع ضبط النقد الفعلي والعجز/الفائض
+// ------------------------------------------------------------
+
+model Shift {
+  id                String      @id @default(cuid())
+  userId            String
+  locationId        String
+  startTime         DateTime    @default(now())
+  endTime           DateTime?
+  totalCash         Decimal     @db.Decimal(12, 2) @default(0) // صافي الكاش (مبيعات - مرتجعات)
+  totalCard         Decimal     @db.Decimal(12, 2) @default(0) // صافي الشبكة (مبيعات - مرتجعات)
+  totalRefundCash   Decimal     @db.Decimal(12, 2) @default(0)
+  totalRefundCard   Decimal     @db.Decimal(12, 2) @default(0)
+  actualCashCounted Decimal?    @db.Decimal(12, 2) // النقد الفعلي المعدود يدوياً في الدرج عند الإغلاق
+  cashDifference    Decimal?    @db.Decimal(12, 2) // actualCashCounted - totalCash (سالب = عجز، موجب = فائض)
+  status            ShiftStatus @default(open)
+
+  user     User     @relation(fields: [userId], references: [id])
+  location Location @relation(fields: [locationId], references: [id])
+  orders   Order[]
+  refunds  Refund[]
+
+  @@index([locationId])
+  @@index([userId])
+  @@index([status])
+}
+
+// ------------------------------------------------------------
+// الفواتير / الطلبات (POS Orders) - مع دعم المزامنة الأوفلاين
+// ------------------------------------------------------------
+
+model Order {
+  id               String        @id @default(cuid())
+  localOrderId     String        @unique // المعرف المولّد محلياً من Dexie.js قبل المزامنة
+  locationId       String
+  userId           String
+  shiftId          String
+  totalAmount      Decimal       @db.Decimal(12, 2)
+  paymentMethod    PaymentMethod
+  cashAmount       Decimal       @db.Decimal(12, 2) @default(0)
+  cardAmount       Decimal       @db.Decimal(12, 2) @default(0)
+  isSynced         Boolean       @default(false)
+  syncFailedReason String?
+  createdAt        DateTime      @default(now())
+
+  location Location    @relation(fields: [locationId], references: [id])
+  user     User        @relation(fields: [userId], references: [id])
+  shift    Shift       @relation(fields: [shiftId], references: [id])
+  items    OrderItem[]
+  refunds  Refund[]
+
+  @@index([locationId])
+  @@index([shiftId])
+  @@index([isSynced])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id        String  @id @default(cuid())
+  orderId   String
+  productId String
+  quantity  Decimal @db.Decimal(12, 2)
+  unitPrice Decimal @db.Decimal(10, 2)
+  subtotal  Decimal @db.Decimal(12, 2)
+
+  order       Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product     Product      @relation(fields: [productId], references: [id])
+  refundItems RefundItem[]
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+// ------------------------------------------------------------
+// المرتجعات (Refunds / Voids)
+// ------------------------------------------------------------
+
+model Refund {
+  id           String   @id @default(cuid())
+  orderId      String
+  locationId   String
+  shiftId      String
+  refundAmount Decimal  @db.Decimal(12, 2)
+  cashAmount   Decimal  @db.Decimal(12, 2) @default(0)
+  cardAmount   Decimal  @db.Decimal(12, 2) @default(0)
+  reason       String?
+  createdById  String
+  createdAt    DateTime @default(now())
+
+  order     Order        @relation(fields: [orderId], references: [id])
+  location  Location     @relation(fields: [locationId], references: [id])
+  shift     Shift        @relation(fields: [shiftId], references: [id])
+  createdBy User         @relation(fields: [createdById], references: [id])
+  items     RefundItem[]
+
+  @@index([orderId])
+  @@index([shiftId])
+  @@index([createdAt])
+}
+
+model RefundItem {
+  id          String  @id @default(cuid())
+  refundId    String
+  orderItemId String
+  productId   String
+  quantity    Decimal @db.Decimal(12, 2)
+  subtotal    Decimal @db.Decimal(12, 2)
+
+  refund    Refund    @relation(fields: [refundId], references: [id], onDelete: Cascade)
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id])
+  product   Product   @relation(fields: [productId], references: [id])
+
+  @@index([refundId])
+  @@index([orderItemId])
+}
